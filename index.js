@@ -24,9 +24,11 @@ admin.initializeApp({
   credential:  admin.credential.cert(serviceAccount),
   databaseURL: process.env.FIREBASE_DATABASE_URL,
   storageBucket: `${process.env.FIREBASE_PROJECT_ID}.firebasestorage.app`,
+  projectId: process.env.FIREBASE_PROJECT_ID,
 });
 
-const db      = admin.firestore();
+const db      = admin.firestore(admin.app(), 'default');
+db.settings({ ignoreUndefinedProperties: true });
 const rtdb    = admin.database();
 const storage = admin.storage();
 
