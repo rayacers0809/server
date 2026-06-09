@@ -133,6 +133,7 @@ app.get('/auth/discord/callback', async (req, res) => {
 
   } catch (err) {
     console.error('[OAuth Error]', err.response?.data || err.message);
+    console.error('[OAuth Error Detail]', err.stack || err);
     res.redirect(`${process.env.CLIENT_URL}?error=oauth_failed`);
   }
 });
