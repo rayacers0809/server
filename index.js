@@ -33,7 +33,7 @@ const rtdb    = admin.database();
 const storage = admin.storage();
 
 // Firestore 서울 리전 설정
-db.settings({ ignoreUndefinedProperties: true });
+
 
 // ─── Express ─────────────────────────────────────────
 const app  = express();
