@@ -54,9 +54,25 @@ function generateCode() {
   return Array.from({ length: 6 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
 }
 
-function authMiddleware(req, res, next) {
-  if (!req.session.userId) return res.status(401).json({ ok: false, reason: '로그인이 필요합니다.' });
-  next();
+async function authMiddleware(req, res, next) {
+  // 1. 세션 체크
+  if (req.session.userId) { next(); return; }
+
+  // 2. Authorization: Bearer <Firebase ID Token>
+  const authHeader = req.headers['authorization'] || '';
+  if (authHeader.startsWith('Bearer ')) {
+    const idToken = authHeader.slice(7);
+    try {
+      const decoded = await admin.auth().verifyIdToken(idToken);
+      req.session.userId   = decoded.uid;
+      req.session.username = decoded.name || decoded.uid;
+      next(); return;
+    } catch(e) {
+      return res.status(401).json({ ok: false, reason: '토큰 인증 실패: ' + e.message });
+    }
+  }
+
+  return res.status(401).json({ ok: false, reason: '로그인이 필요합니다.' });
 }
 
 function botMiddleware(req, res, next) {
