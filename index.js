@@ -214,8 +214,8 @@ app.post('/api/intranet/verify', authMiddleware, async (req, res) => {
   // 팩션 문서
   const factionRef = db.collection('factions').doc();
   batch.set(factionRef, {
-    factionName:  codeData.factionName || '새 팩션',
-    factionType:  codeData.factionType || '기타',
+    factionName:  req.body.factionName || codeData.factionName || '새 팩션',
+    factionType:  req.body.factionType  || codeData.factionType  || '기타',
     founderId:    userId,
     joinCode,
     webhooks:     { rp: '', trade: '', warn: '', notice: '' },
