@@ -132,7 +132,10 @@ app.get('/auth/discord/callback', async (req, res) => {
 
     // 프론트로 custom token 전달 (프론트에서 signInWithCustomToken 호출)
     const clientUrl = (process.env.CLIENT_URL || '').replace(/\/$/, '');
-    res.redirect(`${clientUrl}/auth/success?token=${customToken}`);
+    const mode = req.session.oauthMode || '';
+    req.session.oauthMode = null;
+    const modeParam = mode ? `&mode=${mode}` : '';
+    res.redirect(`${clientUrl}/auth/success?token=${customToken}${modeParam}`);
 
   } catch (err) {
     console.error('[OAuth Error]', err.response?.data || err.message);
