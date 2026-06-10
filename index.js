@@ -248,6 +248,7 @@ app.post('/api/intranet/verify', authMiddleware, async (req, res) => {
     rankClass:  '고위직',
     isFounder:  true,
     perms:      allPerms,
+    status:     'approved',
     joinedAt:   admin.firestore.FieldValue.serverTimestamp(),
     rp_score:   0,
     trade_count:0,
