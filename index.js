@@ -44,9 +44,12 @@ app.use(express.json());
 // CORS - 여러 도메인 허용 (pages.dev + 커스텀 도메인)
 const allowedOrigins = [
   process.env.CLIENT_URL,
+  process.env.ADMIN_URL,
   'https://turnintranet.com',
   'https://turn-intranet.pages.dev',
+  'https://turn-admin.pages.dev',
   'http://localhost:5173',
+  'http://localhost:3000',
 ].filter(Boolean);
 
 app.use(cors({
@@ -482,6 +485,30 @@ app.put('/api/admin/faction/:factionId/webhooks', adminMiddleware, async (req, r
 app.put('/api/admin/faction/:factionId/status', adminMiddleware, async (req, res) => {
   await db.collection('factions').doc(req.params.factionId).update({ active: req.body.active });
   res.json({ ok: true });
+});
+
+// POST /api/admin/webhook-test - Discord 웹훅 테스트 전송
+app.post('/api/admin/webhook-test', adminMiddleware, async (req, res) => {
+  const { url, type } = req.body;
+  if (!url || !url.includes('discord.com/api/webhooks/')) {
+    return res.status(400).json({ ok: false, reason: '올바른 Discord 웹훅 URL이 아닙니다.' });
+  }
+  const typeNames = { rp:'RP 보고서', trade:'거래 보고서', warn:'내부경고', notice:'공지사항', member:'팩션원' };
+  try {
+    await axios.post(url, {
+      username: 'Turn City 인트라넷',
+      embeds: [{
+        title: `✅ ${typeNames[type] || '웹훅'} 테스트`,
+        description: '웹훅이 정상적으로 연결되었습니다.',
+        color: 0x2563EB,
+        footer: { text: 'Turn City Intranet' },
+        timestamp: new Date().toISOString(),
+      }],
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ ok: false, reason: '웹훅 전송 실패 (URL 확인 필요)' });
+  }
 });
 
 // ─── 헬스 체크 ──────────────────────────────────────────
