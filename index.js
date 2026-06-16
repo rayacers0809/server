@@ -40,12 +40,37 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:5173', credentials: true }));
+
+// CORS - 여러 도메인 허용 (pages.dev + 커스텀 도메인)
+const allowedOrigins = [
+  process.env.CLIENT_URL,
+  'https://turnintranet.com',
+  'https://turn-intranet.pages.dev',
+  'http://localhost:5173',
+].filter(Boolean);
+
+app.use(cors({
+  origin: function(origin, callback) {
+    // origin 없는 요청(서버간/curl)도 허용
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(null, true); // 일단 모두 허용 (프로덕션에선 false 권장)
+  },
+  credentials: true,
+}));
+
+// 프록시(Railway) 뒤에서 secure 쿠키 작동하게
+app.set('trust proxy', 1);
+
+const isProd = process.env.NODE_ENV === 'production' || !!process.env.CLIENT_URL?.startsWith('https');
 app.use(session({
   secret: process.env.SESSION_SECRET || 'change-this',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 7 * 24 * 60 * 60 * 1000 },
+  cookie: {
+    secure: isProd,                          // HTTPS에서만 secure
+    sameSite: isProd ? 'none' : 'lax',       // 크로스 도메인 쿠키
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  },
 }));
 
 // ─── 유틸 ────────────────────────────────────────────
@@ -218,8 +243,8 @@ app.post('/api/intranet/verify', authMiddleware, async (req, res) => {
     factionType:  req.body.factionType  || codeData.factionType  || '기타',
     founderId:    userId,
     joinCode,
-    webhooks:     { rp: '', trade: '', warn: '', notice: '' },
-    settings:     { rpApprovalRequired: true, tradeAudit: true, rankSystem: true },
+    webhooks:     { rp: '', trade: '', warn: '', notice: '', member: '' },
+    settings:     { rpEnabled: true, tradeEnabled: true, rpApprovalRequired: true, tradeAudit: true, rankSystem: true, attendanceAuto: true },
     theme:        { primaryColor: '#2563EB' },
     createdAt:    admin.firestore.FieldValue.serverTimestamp(),
     memberCount:  1,
@@ -277,7 +302,7 @@ app.post('/api/intranet/verify', authMiddleware, async (req, res) => {
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  res.json({ ok: true, factionId: factionRef.id, factionName: codeData.factionName, joinCode });
+  res.json({ ok: true, factionId: factionRef.id, factionName: req.body.factionName || codeData.factionName, joinCode });
 });
 
 // ════════════════════════════════════════════════════════
