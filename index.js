@@ -109,6 +109,13 @@ function botMiddleware(req, res, next) {
   next();
 }
 
+// 게임(FiveM) 서버 인증
+function gameMiddleware(req, res, next) {
+  if (req.headers['x-game-secret'] !== process.env.GAME_SECRET)
+    return res.status(403).json({ ok: false, reason: '게임 서버 인증 실패' });
+  next();
+}
+
 // ════════════════════════════════════════════════════════
 // DISCORD OAUTH
 // ════════════════════════════════════════════════════════
@@ -514,6 +521,170 @@ app.post('/api/admin/webhook-test', adminMiddleware, async (req, res) => {
 // ─── 헬스 체크 ──────────────────────────────────────────
 app.get('/health', async (req, res) => {
   res.json({ ok: true, uptime: process.uptime(), project: process.env.FIREBASE_PROJECT_ID });
+});
+
+
+
+// ════════════════════════════════════════════════════════
+// 웹훅 발송 (인트라넷에서 공지/보고서 등 작성 시)
+// ════════════════════════════════════════════════════════
+
+// POST /api/intranet/notify - Firebase ID 토큰 인증 후 웹훅 발송
+// body: { factionId, type: 'notice'|'rp'|'trade'|'warn'|'member', data: {...} }
+app.post('/api/intranet/notify', authMiddleware, async (req, res) => {
+  const { factionId, type, data } = req.body;
+  if (!factionId || !type) {
+    return res.status(400).json({ ok: false, reason: '필수 값 누락' });
+  }
+
+  try {
+    // 팩션의 웹훅 설정 조회
+    const facDoc = await db.collection('factions').doc(factionId).get();
+    if (!facDoc.exists) return res.status(404).json({ ok: false, reason: '팩션 없음' });
+
+    // 요청자가 해당 팩션 멤버인지 확인 (권한)
+    const memberDoc = await db.collection('factions').doc(factionId).collection('members').doc(req.session.userId).get();
+    if (!memberDoc.exists) return res.status(403).json({ ok: false, reason: '권한 없음' });
+
+    const webhooks = facDoc.data().webhooks || {};
+    const url = webhooks[type];
+    if (!url || !url.includes('discord.com/api/webhooks/')) {
+      return res.json({ ok: true, skipped: true, reason: '웹훅 미설정' });
+    }
+
+    // 타입별 임베드 구성
+    const factionName = facDoc.data().factionName || '팩션';
+    const embeds = buildEmbed(type, data, factionName);
+
+    await axios.post(url, { username: `${factionName} 인트라넷`, embeds });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[notify]', err.message);
+    res.status(500).json({ ok: false, reason: err.message });
+  }
+});
+
+// 타입별 Discord 임베드 생성
+function buildEmbed(type, d, factionName) {
+  const colors = { notice:0x2563EB, rp:0x8B5CF6, trade:0xF59E0B, warn:0xEF4444, member:0x22C55E };
+  const titles = { notice:'📢 새 공지사항', rp:'📋 RP 보고서', trade:'💰 거래 보고서', warn:'⚠️ 내부경고', member:'👤 팩션원 변동' };
+  const fields = [];
+
+  if (type === 'notice') {
+    fields.push({ name: '제목', value: String(d.title || '-').slice(0,256) });
+    if (d.content) fields.push({ name: '내용', value: String(d.content).slice(0,1024) });
+    fields.push({ name: '작성자', value: String(d.author || '-'), inline: true });
+  } else if (type === 'rp') {
+    fields.push({ name: '구역', value: String(d.zone || '-'), inline: true });
+    fields.push({ name: '결과', value: d.result === 'win' ? '✅ 승리' : '❌ 패배', inline: true });
+    fields.push({ name: '작성자', value: String(d.author || '-'), inline: true });
+  } else if (type === 'trade') {
+    fields.push({ name: '물품', value: String(d.item || '-'), inline: true });
+    fields.push({ name: '수량', value: String(d.qty || 0) + '개', inline: true });
+    fields.push({ name: '금액', value: '₩' + Number(d.amount||0).toLocaleString(), inline: true });
+    fields.push({ name: '작성자', value: String(d.author || '-'), inline: true });
+  } else if (type === 'warn') {
+    fields.push({ name: '대상', value: String(d.target || '-'), inline: true });
+    fields.push({ name: '수위', value: String(d.level || '-'), inline: true });
+    if (d.reason) fields.push({ name: '사유', value: String(d.reason).slice(0,1024) });
+  } else if (type === 'member') {
+    fields.push({ name: '내용', value: String(d.message || '-') });
+  }
+
+  return [{
+    title: titles[type] || '알림',
+    color: colors[type] || 0x2563EB,
+    fields,
+    footer: { text: `${factionName} · Turn City Intranet` },
+    timestamp: new Date().toISOString(),
+  }];
+}
+
+// ════════════════════════════════════════════════════════
+// 게임(FiveM) 연동 - 출퇴근
+// ════════════════════════════════════════════════════════
+
+// POST /api/game/attendance - 게임에서 출퇴근 시 호출
+// body: { discordId, action: 'in'|'out', gameName }
+app.post('/api/game/attendance', gameMiddleware, async (req, res) => {
+  const { discordId, action, gameName } = req.body;
+  if (!discordId || !['in','out'].includes(action)) {
+    return res.status(400).json({ ok: false, reason: '필수 값 누락 (discordId, action)' });
+  }
+
+  try {
+    // 1. Discord ID로 유저 찾기 (인트라넷 users 컬렉션, 문서 ID = Discord ID)
+    const userDoc = await db.collection('users').doc(String(discordId)).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ ok: false, reason: '인트라넷에 등록되지 않은 유저' });
+    }
+    const factionId = userDoc.data().factionId;
+    if (!factionId) {
+      return res.status(404).json({ ok: false, reason: '소속 팩션 없음' });
+    }
+
+    // 2. 멤버 확인 (승인된 멤버만)
+    const memberRef = db.collection('factions').doc(factionId).collection('members').doc(String(discordId));
+    const memberDoc = await memberRef.get();
+    if (!memberDoc.exists) {
+      return res.status(404).json({ ok: false, reason: '팩션 멤버 아님' });
+    }
+    const memberData = memberDoc.data();
+    if (memberData.status !== 'approved' && !memberData.isFounder) {
+      return res.status(403).json({ ok: false, reason: '승인 대기 중인 멤버' });
+    }
+
+    // 3. 오늘 출근 문서
+    const today = new Date().toISOString().split('T')[0];
+    const attRef = db.collection('factions').doc(factionId).collection('attendance').doc(`${discordId}_${today}`);
+    const attSnap = await attRef.get();
+    const username = memberData.username || gameName || '게임유저';
+    const FieldValue = admin.firestore.FieldValue;
+
+    let sessions = attSnap.exists ? (attSnap.data().sessions || []) : [];
+    const openIdx = sessions.map(s => s.checkOut).lastIndexOf(null);
+    const now = new Date().toISOString();
+
+    if (action === 'in') {
+      // 이미 출근 중이면 무시
+      if (openIdx !== -1) {
+        return res.json({ ok: true, already: true, message: '이미 출근 중' });
+      }
+      sessions.push({ checkIn: now, checkOut: null, source: 'game' });
+    } else {
+      // 퇴근 - 열린 세션 닫기
+      if (openIdx === -1) {
+        return res.json({ ok: true, already: true, message: '출근 기록 없음' });
+      }
+      sessions[openIdx].checkOut = now;
+    }
+
+    // 총 근무시간 재계산
+    const totalMinutes = sessions.reduce((sum, s) => {
+      if (!s.checkIn || !s.checkOut) return sum;
+      return sum + Math.max(0, Math.floor((new Date(s.checkOut) - new Date(s.checkIn)) / 60000));
+    }, 0);
+
+    await attRef.set({
+      userId: String(discordId), username, date: today, status: 'O',
+      sessions, totalMinutes,
+    }, { merge: true });
+
+    // 활동 로그
+    try {
+      await db.collection('factions').doc(factionId).collection('activity_logs').add({
+        type: action === 'in' ? 'game_checkin' : 'game_checkout',
+        message: `${username}님이 게임에서 ${action === 'in' ? '출근' : '퇴근'}했습니다.`,
+        userId: String(discordId),
+        createdAt: FieldValue.serverTimestamp(),
+      });
+    } catch (e) {}
+
+    res.json({ ok: true, action, totalMinutes });
+  } catch (err) {
+    console.error('[game/attendance]', err);
+    res.status(500).json({ ok: false, reason: err.message });
+  }
 });
 
 app.listen(PORT, () => console.log(`[Turn City API] http://localhost:${PORT}`));
