@@ -607,7 +607,7 @@ function buildEmbed(type, d, factionName) {
 
 // POST /api/intranet/fine - 인트라넷에서 벌금 부과 → 게임으로 전달
 app.post('/api/intranet/fine', authMiddleware, async (req, res) => {
-  const { factionId, targetUserId, totalFine, totalJail, items } = req.body;
+  const { factionId, targetUserId, totalFine, totalJail, items, issuerName } = req.body;
   if (!factionId || !targetUserId) {
     return res.status(400).json({ ok: false, reason: '필수 값 누락' });
   }
@@ -616,6 +616,39 @@ app.post('/api/intranet/fine', authMiddleware, async (req, res) => {
   try {
     const memberDoc = await db.collection('factions').doc(factionId).collection('members').doc(req.session.userId).get();
     if (!memberDoc.exists) return res.status(403).json({ ok: false, reason: '권한 없음' });
+
+    // 디스코드 벌금 로그 웹훅 발송
+    try {
+      const facDoc = await db.collection('factions').doc(factionId).get();
+      const facData = facDoc.exists ? facDoc.data() : {};
+      // 우선순위: 팩션 설정 fineWebhook > 환경변수 FINE_WEBHOOK_URL
+      const fineWebhook = (facData.webhooks && facData.webhooks.fine) || process.env.FINE_WEBHOOK_URL;
+      if (fineWebhook && fineWebhook.includes('discord.com/api/webhooks/')) {
+        const itemList = (items || []).map(i =>
+          `• ${i.name}${i.jail > 0 ? ` (구금 ${i.jail}분)` : ''}`
+        ).join('\n') || '항목 없음';
+        await axios.post(fineWebhook, {
+          username: `${facData.factionName || '경찰청'} 벌금 시스템`,
+          embeds: [{
+            title: '🚨 벌금 부과 내역',
+            color: 0xEF4444,
+            fields: [
+              { name: '담당 공무원', value: String(issuerName || memberDoc.data().username || '-'), inline: true },
+              { name: '대상 고유번호', value: String(targetUserId), inline: true },
+              { name: '\u200b', value: '\u200b', inline: true },
+              { name: '총 벌금', value: `₩${Number(totalFine||0).toLocaleString()}`, inline: true },
+              { name: '총 구금', value: `${totalJail||0}분`, inline: true },
+              { name: '\u200b', value: '\u200b', inline: true },
+              { name: '위반 항목', value: itemList.slice(0, 1024) },
+            ],
+            footer: { text: 'Turn City 벌금 로그' },
+            timestamp: new Date().toISOString(),
+          }],
+        });
+      }
+    } catch (whErr) {
+      console.warn('[fine webhook]', whErr.message);
+    }
 
     // 게임 서버로 벌금 전달 (게임 서버가 GAME_WEBHOOK_URL로 수신)
     // 게임 리소스가 폴링하거나, 게임 서버 엔드포인트로 push
