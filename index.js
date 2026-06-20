@@ -600,6 +600,70 @@ function buildEmbed(type, d, factionName) {
   }];
 }
 
+
+// ════════════════════════════════════════════════════════
+// 벌금 부과 (인트라넷 → 게임)
+// ════════════════════════════════════════════════════════
+
+// POST /api/intranet/fine - 인트라넷에서 벌금 부과 → 게임으로 전달
+app.post('/api/intranet/fine', authMiddleware, async (req, res) => {
+  const { factionId, targetUserId, totalFine, totalJail, items } = req.body;
+  if (!factionId || !targetUserId) {
+    return res.status(400).json({ ok: false, reason: '필수 값 누락' });
+  }
+
+  // 요청자가 해당 팩션의 공무원인지 확인
+  try {
+    const memberDoc = await db.collection('factions').doc(factionId).collection('members').doc(req.session.userId).get();
+    if (!memberDoc.exists) return res.status(403).json({ ok: false, reason: '권한 없음' });
+
+    // 게임 서버로 벌금 전달 (게임 서버가 GAME_WEBHOOK_URL로 수신)
+    // 게임 리소스가 폴링하거나, 게임 서버 엔드포인트로 push
+    const gameUrl = process.env.GAME_SERVER_URL; // 게임 서버 주소 (선택)
+    let gameSent = false;
+    if (gameUrl) {
+      try {
+        await axios.post(gameUrl + '/fine', {
+          targetUserId, totalFine, totalJail, items,
+        }, { headers: { 'x-game-secret': process.env.GAME_SECRET }, timeout: 5000 });
+        gameSent = true;
+      } catch (e) {
+        console.warn('[fine] 게임 전송 실패:', e.message);
+      }
+    } else {
+      // 게임 서버 주소 미설정 시: 대기열(pending_fines)에 저장 → 게임이 폴링
+      await db.collection('pending_fines').add({
+        factionId, targetUserId, totalFine, totalJail, items,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        claimed: false,
+      });
+      gameSent = true; // 대기열 등록 성공
+    }
+
+    res.json({ ok: gameSent, queued: !gameUrl });
+  } catch (err) {
+    console.error('[fine]', err.message);
+    res.status(500).json({ ok: false, reason: err.message });
+  }
+});
+
+// GET /api/game/pending-fines - 게임 서버가 대기 중인 벌금 가져가기 (폴링)
+app.get('/api/game/pending-fines', gameMiddleware, async (req, res) => {
+  try {
+    const snap = await db.collection('pending_fines').where('claimed','==',false).limit(50).get();
+    const fines = [];
+    const batch = db.batch();
+    snap.forEach(doc => {
+      fines.push({ id: doc.id, ...doc.data() });
+      batch.update(doc.ref, { claimed: true });
+    });
+    if (fines.length) await batch.commit();
+    res.json({ ok: true, fines });
+  } catch (err) {
+    res.status(500).json({ ok: false, reason: err.message });
+  }
+});
+
 // ════════════════════════════════════════════════════════
 // 게임(FiveM) 연동 - 출퇴근
 // ════════════════════════════════════════════════════════
