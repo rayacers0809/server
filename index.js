@@ -500,7 +500,7 @@ app.post('/api/admin/webhook-test', adminMiddleware, async (req, res) => {
   if (!url || !url.includes('discord.com/api/webhooks/')) {
     return res.status(400).json({ ok: false, reason: '올바른 Discord 웹훅 URL이 아닙니다.' });
   }
-  const typeNames = { rp:'RP 보고서', trade:'거래 보고서', warn:'내부경고', notice:'공지사항', member:'팩션원' };
+  const typeNames = { rp:'RP 보고서', trade:'거래 보고서', warn:'내부경고', notice:'공지사항', member:'팩션원', fine:'벌금 부과' };
   try {
     await axios.post(url, {
       username: 'Turn City 인트라넷',
