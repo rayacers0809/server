@@ -84,7 +84,10 @@ function generateCode() {
 
 async function authMiddleware(req, res, next) {
   // 1. 세션 체크
-  if (req.session.userId) { next(); return; }
+  if (req.session && req.session.userId) {
+    req.userId = req.session.userId;
+    next(); return;
+  }
 
   // 2. Authorization: Bearer <Firebase ID Token>
   const authHeader = req.headers['authorization'] || '';
@@ -92,8 +95,11 @@ async function authMiddleware(req, res, next) {
     const idToken = authHeader.slice(7);
     try {
       const decoded = await admin.auth().verifyIdToken(idToken);
-      req.session.userId   = decoded.uid;
-      req.session.username = decoded.name || decoded.uid;
+      req.userId = decoded.uid;  // 같은 요청에서 바로 사용
+      if (req.session) {
+        req.session.userId   = decoded.uid;
+        req.session.username = decoded.name || decoded.uid;
+      }
       next(); return;
     } catch(e) {
       return res.status(401).json({ ok: false, reason: '토큰 인증 실패: ' + e.message });
@@ -212,6 +218,13 @@ app.post('/auth/logout', (req, res) => {
 // 인트라넷 코드 검증 & 팩션 생성
 // ════════════════════════════════════════════════════════
 app.post('/api/intranet/verify', authMiddleware, async (req, res) => {
+  // 이중 팩션 방지: 이미 팩션 소속이면 생성 불가
+  try {
+    const existingUser = await db.collection('users').doc(req.userId).get();
+    if (existingUser.exists && existingUser.data().factionId) {
+      return res.status(400).json({ ok: false, reason: '이미 소속된 팩션이 있습니다. 한 계정은 하나의 팩션만 가능합니다.' });
+    }
+  } catch (e) {}
   const { code, founderRankName } = req.body;
   if (!code) return res.status(400).json({ ok: false, reason: '코드를 입력해주세요.' });
 
@@ -543,7 +556,7 @@ app.post('/api/intranet/notify', authMiddleware, async (req, res) => {
     if (!facDoc.exists) return res.status(404).json({ ok: false, reason: '팩션 없음' });
 
     // 요청자가 해당 팩션 멤버인지 확인 (권한)
-    const memberDoc = await db.collection('factions').doc(factionId).collection('members').doc(req.session.userId).get();
+    const memberDoc = await db.collection('factions').doc(factionId).collection('members').doc(req.userId).get();
     if (!memberDoc.exists) return res.status(403).json({ ok: false, reason: '권한 없음' });
 
     const webhooks = facDoc.data().webhooks || {};
@@ -614,13 +627,20 @@ app.post('/api/intranet/fine', authMiddleware, async (req, res) => {
 
   // 요청자가 해당 팩션의 공무원인지 확인
   try {
-    const memberDoc = await db.collection('factions').doc(factionId).collection('members').doc(req.session.userId).get();
+    const memberDoc = await db.collection('factions').doc(factionId).collection('members').doc(req.userId).get();
     if (!memberDoc.exists) return res.status(403).json({ ok: false, reason: '권한 없음' });
+
+    // 공무 팩션만 벌금 부과 가능 (악용 방지 - 서버 검증)
+    const facDoc = await db.collection('factions').doc(factionId).get();
+    const facData = facDoc.exists ? facDoc.data() : {};
+    const facType = (facData.factionType || '').toLowerCase();
+    const govKeywords = ['police','ems','경찰','공무','소방','병원','구급'];
+    if (!govKeywords.some(k => facType.includes(k.toLowerCase()))) {
+      return res.status(403).json({ ok: false, reason: '공무 팩션만 벌금을 부과할 수 있습니다.' });
+    }
 
     // 디스코드 벌금 로그 웹훅 발송
     try {
-      const facDoc = await db.collection('factions').doc(factionId).get();
-      const facData = facDoc.exists ? facDoc.data() : {};
       // 우선순위: 팩션 설정 fineWebhook > 환경변수 FINE_WEBHOOK_URL
       const fineWebhook = (facData.webhooks && facData.webhooks.fine) || process.env.FINE_WEBHOOK_URL;
       if (fineWebhook && fineWebhook.includes('discord.com/api/webhooks/')) {
