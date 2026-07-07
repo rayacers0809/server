@@ -457,9 +457,22 @@ app.get('/api/admin/logs', adminMiddleware, async (req, res) => {
       .orderBy('createdAt', 'desc')
       .limit(50)
       .get();
-    res.json({ ok: true, logs: snap.docs.map(d => ({ id: d.id, ...d.data() })) });
-  } catch {
-    res.json({ ok: true, logs: [] });
+    // 각 로그에 팩션 정보 추가 (어느 팩션 로그인지)
+    const logs = snap.docs.map(d => {
+      const data = d.data();
+      // 경로: factions/{factionId}/activity_logs/{logId}
+      const factionId = d.ref.parent.parent?.id || '';
+      return { id: d.id, factionId, ...data };
+    });
+    res.json({ ok: true, logs });
+  } catch (err) {
+    console.error('[admin/logs] 에러:', err.message);
+    // 인덱스 필요 에러면 안내
+    if (err.message && err.message.includes('index')) {
+      console.error('[admin/logs] ⚠️ Firestore collectionGroup 인덱스 필요:', err.message);
+      return res.json({ ok: false, logs: [], reason: 'Firestore 인덱스 생성 필요 (콘솔 확인)', indexUrl: err.message });
+    }
+    res.json({ ok: false, logs: [], reason: err.message });
   }
 });
 
@@ -505,6 +518,70 @@ app.put('/api/admin/faction/:factionId/webhooks', adminMiddleware, async (req, r
 app.put('/api/admin/faction/:factionId/status', adminMiddleware, async (req, res) => {
   await db.collection('factions').doc(req.params.factionId).update({ active: req.body.active });
   res.json({ ok: true });
+});
+
+// GET /api/admin/maintenance - 점검모드 상태 조회 (공개, 인트라넷이 체크)
+app.get('/api/admin/maintenance', async (req, res) => {
+  try {
+    const doc = await db.collection('system').doc('config').get();
+    const on = doc.exists ? (doc.data().maintenance === true) : false;
+    const message = doc.exists ? (doc.data().maintenanceMessage || '') : '';
+    res.json({ ok: true, maintenance: on, message });
+  } catch (err) {
+    res.json({ ok: true, maintenance: false, message: '' });
+  }
+});
+
+// PUT /api/admin/maintenance - 점검모드 설정 (관리자만)
+app.put('/api/admin/maintenance', adminMiddleware, async (req, res) => {
+  const { maintenance, message } = req.body;
+  try {
+    await db.collection('system').doc('config').set({
+      maintenance: maintenance === true,
+      maintenanceMessage: message || '시스템 점검 중입니다. 잠시 후 다시 이용해주세요.',
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    res.json({ ok: true, maintenance: maintenance === true });
+  } catch (err) {
+    res.status(500).json({ ok: false, reason: err.message });
+  }
+});
+
+// GET /api/admin/faction/:factionId/members - 팩션원 목록 조회
+app.get('/api/admin/faction/:factionId/members', adminMiddleware, async (req, res) => {
+  try {
+    const snap = await db.collection('factions').doc(req.params.factionId).collection('members').get();
+    const members = snap.docs.map(d => {
+      const m = d.data();
+      return {
+        id: d.id,
+        username: m.username || '-',
+        gameId: m.gameId || '',
+        rankName: m.rankName || '미지정',
+        rankClass: m.rankClass || '',
+        isFounder: m.isFounder || false,
+        status: m.status || 'unknown',
+        rp_score: m.rp_score || 0,
+        trade_count: m.trade_count || 0,
+        warn_count: m.warn_count || 0,
+      };
+    });
+    res.json({ ok: true, members });
+  } catch (err) {
+    res.status(500).json({ ok: false, reason: err.message });
+  }
+});
+
+// PUT /api/admin/faction/:factionId/type - 팩션 구분(factionType) 변경 (관리자만)
+app.put('/api/admin/faction/:factionId/type', adminMiddleware, async (req, res) => {
+  const { factionType } = req.body;
+  if (!factionType) return res.status(400).json({ ok: false, reason: 'factionType 필요' });
+  try {
+    await db.collection('factions').doc(req.params.factionId).update({ factionType });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, reason: err.message });
+  }
 });
 
 // POST /api/admin/webhook-test - Discord 웹훅 테스트 전송
