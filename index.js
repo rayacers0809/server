@@ -452,26 +452,44 @@ app.get('/api/admin/codes', adminMiddleware, async (req, res) => {
 
 // GET /api/admin/logs
 app.get('/api/admin/logs', adminMiddleware, async (req, res) => {
+  // 방법 1: collectionGroup (빠름, 인덱스 필요)
   try {
     const snap = await db.collectionGroup('activity_logs')
       .orderBy('createdAt', 'desc')
       .limit(50)
       .get();
-    // 각 로그에 팩션 정보 추가 (어느 팩션 로그인지)
     const logs = snap.docs.map(d => {
       const data = d.data();
-      // 경로: factions/{factionId}/activity_logs/{logId}
       const factionId = d.ref.parent.parent?.id || '';
       return { id: d.id, factionId, ...data };
     });
-    res.json({ ok: true, logs });
+    return res.json({ ok: true, logs, method: 'collectionGroup' });
   } catch (err) {
-    console.error('[admin/logs] 에러:', err.message);
-    // 인덱스 필요 에러면 안내
-    if (err.message && err.message.includes('index')) {
-      console.error('[admin/logs] ⚠️ Firestore collectionGroup 인덱스 필요:', err.message);
-      return res.json({ ok: false, logs: [], reason: 'Firestore 인덱스 생성 필요 (콘솔 확인)', indexUrl: err.message });
+    console.warn('[admin/logs] collectionGroup 실패, 폴백 사용:', err.message);
+  }
+
+  // 방법 2: 폴백 - 팩션별로 순회 (인덱스 불필요, 느리지만 확실)
+  try {
+    const facSnap = await db.collection('factions').get();
+    let allLogs = [];
+    for (const facDoc of facSnap.docs) {
+      try {
+        const logSnap = await facDoc.ref.collection('activity_logs')
+          .orderBy('createdAt', 'desc').limit(20).get();
+        logSnap.docs.forEach(d => {
+          allLogs.push({ id: d.id, factionId: facDoc.id, factionName: facDoc.data().factionName || '', ...d.data() });
+        });
+      } catch (e) {}
     }
+    // 시간순 정렬 후 최근 50개
+    allLogs.sort((a, b) => {
+      const ta = a.createdAt?._seconds || a.createdAt?.seconds || 0;
+      const tb = b.createdAt?._seconds || b.createdAt?.seconds || 0;
+      return tb - ta;
+    });
+    res.json({ ok: true, logs: allLogs.slice(0, 50), method: 'fallback' });
+  } catch (err) {
+    console.error('[admin/logs] 폴백도 실패:', err.message);
     res.json({ ok: false, logs: [], reason: err.message });
   }
 });
