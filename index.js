@@ -584,6 +584,54 @@ app.put('/api/admin/faction/:factionId/type', adminMiddleware, async (req, res) 
   }
 });
 
+// DELETE /api/admin/faction/:factionId - 팩션 완전 삭제 (관리자만, 되돌릴 수 없음)
+app.delete('/api/admin/faction/:factionId', adminMiddleware, async (req, res) => {
+  const factionId = req.params.factionId;
+  try {
+    const facRef = db.collection('factions').doc(factionId);
+    const facDoc = await facRef.get();
+    if (!facDoc.exists) return res.status(404).json({ ok: false, reason: '팩션을 찾을 수 없습니다.' });
+
+    // 1. 서브컬렉션 전부 삭제
+    const subcollections = ['members','ranks','notices','reports_rp','reports_trade','transactions','warnings','attendance','zones','items','activity_logs','fines'];
+    for (const sub of subcollections) {
+      const snap = await facRef.collection(sub).get();
+      const batches = [];
+      let batch = db.batch();
+      let count = 0;
+      for (const doc of snap.docs) {
+        batch.delete(doc.ref);
+        count++;
+        if (count % 400 === 0) { batches.push(batch.commit()); batch = db.batch(); }
+      }
+      batches.push(batch.commit());
+      await Promise.all(batches);
+    }
+
+    // 2. 소속 유저들의 factionId 해제
+    const usersSnap = await db.collection('users').where('factionId','==',factionId).get();
+    let ubatch = db.batch();
+    usersSnap.forEach(doc => ubatch.update(doc.ref, { factionId: null, factionStatus: null }));
+    if (!usersSnap.empty) await ubatch.commit();
+
+    // 3. 팩션 문서 삭제
+    await facRef.delete();
+
+    // 4. 관련 코드도 정리 (선택)
+    try {
+      const codesSnap = await db.collection('intranetCodes').where('factionId','==',factionId).get();
+      let cbatch = db.batch();
+      codesSnap.forEach(doc => cbatch.delete(doc.ref));
+      if (!codesSnap.empty) await cbatch.commit();
+    } catch (e) {}
+
+    res.json({ ok: true, deletedMembers: usersSnap.size });
+  } catch (err) {
+    console.error('[faction delete]', err.message);
+    res.status(500).json({ ok: false, reason: err.message });
+  }
+});
+
 // POST /api/admin/webhook-test - Discord 웹훅 테스트 전송
 app.post('/api/admin/webhook-test', adminMiddleware, async (req, res) => {
   const { url, type } = req.body;
