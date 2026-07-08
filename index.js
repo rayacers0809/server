@@ -776,10 +776,10 @@ app.post('/api/intranet/fine', authMiddleware, async (req, res) => {
     // 공무 팩션만 벌금 부과 가능 (악용 방지 - 서버 검증)
     const facDoc = await db.collection('factions').doc(factionId).get();
     const facData = facDoc.exists ? facDoc.data() : {};
-    const facType = (facData.factionType || '').toLowerCase();
-    const govKeywords = ['police','ems','경찰','공무','소방','병원','구급'];
-    if (!govKeywords.some(k => facType.includes(k.toLowerCase()))) {
-      return res.status(403).json({ ok: false, reason: '공무 팩션만 벌금을 부과할 수 있습니다.' });
+    const facType = facData.factionType || '';
+    const isGov = facType.includes('공무') || facType.toLowerCase().includes('police');
+    if (!isGov) {
+      return res.status(403).json({ ok: false, reason: '공무원 팩션만 벌금을 부과할 수 있습니다.' });
     }
 
     // 디스코드 벌금 로그 웹훅 발송
