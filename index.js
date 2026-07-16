@@ -590,6 +590,55 @@ app.get('/api/admin/faction/:factionId/members', adminMiddleware, async (req, re
   }
 });
 
+// POST /api/intranet/kick-member - 팩션원 퇴단/사직 처리 (팩션장/관리자)
+app.post('/api/intranet/kick-member', authMiddleware, async (req, res) => {
+  const { factionId, targetUserId } = req.body;
+  if (!factionId || !targetUserId) {
+    return res.status(400).json({ ok: false, reason: '필수 값 누락' });
+  }
+  try {
+    // 요청자 권한 확인 (팩션장 또는 member_manage)
+    const requester = await db.collection('factions').doc(factionId).collection('members').doc(req.userId).get();
+    if (!requester.exists) return res.status(403).json({ ok: false, reason: '권한 없음' });
+    const rData = requester.data();
+    const canManage = rData.isFounder || (rData.perms || []).includes('member_manage');
+    if (!canManage) return res.status(403).json({ ok: false, reason: '팩션원 관리 권한 없음' });
+
+    // 대상이 팩션장이면 거부 (팩션장은 위임 후에만)
+    const target = await db.collection('factions').doc(factionId).collection('members').doc(targetUserId).get();
+    if (target.exists && target.data().isFounder) {
+      return res.status(400).json({ ok: false, reason: '팩션장은 퇴단시킬 수 없습니다.' });
+    }
+
+    // 1. members 문서 삭제
+    await db.collection('factions').doc(factionId).collection('members').doc(targetUserId).delete();
+
+    // 2. 해당 유저의 출근부 기록 삭제 (선택 - attendance)
+    try {
+      const attSnap = await db.collection('factions').doc(factionId).collection('attendance')
+        .where('userId', '==', targetUserId).get();
+      const batch = db.batch();
+      attSnap.forEach(d => batch.delete(d.ref));
+      if (!attSnap.empty) await batch.commit();
+    } catch (e) {}
+
+    // 3. users 문서의 factionId 초기화 (Admin SDK라 규칙 무시)
+    await db.collection('users').doc(targetUserId).set({
+      factionId: null, factionStatus: null,
+    }, { merge: true });
+
+    // 4. memberCount 감소
+    await db.collection('factions').doc(factionId).update({
+      memberCount: admin.firestore.FieldValue.increment(-1),
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[kick-member]', err.message);
+    res.status(500).json({ ok: false, reason: err.message });
+  }
+});
+
 // PUT /api/admin/faction/:factionId/type - 팩션 구분(factionType) 변경 (관리자만)
 app.put('/api/admin/faction/:factionId/type', adminMiddleware, async (req, res) => {
   const { factionType } = req.body;
@@ -776,8 +825,8 @@ app.post('/api/intranet/fine', authMiddleware, async (req, res) => {
     // 공무 팩션만 벌금 부과 가능 (악용 방지 - 서버 검증)
     const facDoc = await db.collection('factions').doc(factionId).get();
     const facData = facDoc.exists ? facDoc.data() : {};
-    const facType = facData.factionType || '';
-    const isGov = facType.includes('공무') || facType.toLowerCase().includes('police');
+    const facType = (facData.factionType || '').toLowerCase();
+    const isGov = facType.includes('공무') || facType.includes('경찰') || facType.includes('police');
     if (!isGov) {
       return res.status(403).json({ ok: false, reason: '공무원 팩션만 벌금을 부과할 수 있습니다.' });
     }
