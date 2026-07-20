@@ -559,52 +559,112 @@ function kstWeekKey(date) {
   return `${start.getUTCFullYear()}-${p(start.getUTCMonth() + 1)}-${p(start.getUTCDate())}`;
 }
 
-// 특정 주의 벌금 집계 (전 팩션)
+// 특정 주의 전체 실적 집계 (전 팩션) - RP/거래/경고/출근/벌금
 async function aggregateWeek(weekStart, weekEnd) {
   const facSnap = await db.collection('factions').get();
   const factions = [];
-  let grandFine = 0, grandJail = 0, grandCount = 0;
+  const grand = { rpScore: 0, rpCount: 0, tradeCount: 0, tradeAmount: 0, warnCount: 0, attCount: 0, fine: 0, jail: 0, fineCount: 0 };
+
+  const inWeek = (d) => {
+    if (d.archived === true) return false;
+    const t = d.createdAt?.toDate?.();
+    return t ? (t >= weekStart && t < weekEnd) : false;
+  };
 
   for (const facDoc of facSnap.docs) {
-    let fineSnap;
+    const fac = facDoc.ref;
+    const byMember = {};   // userId -> 실적
+    const touch = (id, name) => {
+      if (!byMember[id]) byMember[id] = { userId: id, name: name || '-', rpScore: 0, rpCount: 0, tradeCount: 0, tradeAmount: 0, warnCount: 0, attDays: 0, fine: 0, jail: 0, fineCount: 0 };
+      if (name && byMember[id].name === '-') byMember[id].name = name;
+      return byMember[id];
+    };
+    const t = { rpScore: 0, rpCount: 0, tradeCount: 0, tradeAmount: 0, warnCount: 0, attCount: 0, fine: 0, jail: 0, fineCount: 0 };
+
+    // RP 보고서 (승인분만)
     try {
-      fineSnap = await facDoc.ref.collection('fines').get();
-    } catch (e) { continue; }
-    if (fineSnap.empty) continue;
+      const snap = await fac.collection('reports_rp').get();
+      snap.docs.forEach(d => {
+        const r = d.data();
+        if (!inWeek(r) || r.status !== 'approved') return;
+        const sc = (r.realScore != null ? r.realScore : (r.score || 0));
+        const m2 = touch(r.authorId, r.authorName);
+        m2.rpScore += sc; m2.rpCount++;
+        t.rpScore += sc; t.rpCount++;
+      });
+    } catch (e) {}
 
-    const byIssuer = {};
-    let fTotal = 0, jTotal = 0, cTotal = 0;
+    // 거래 보고서 (승인분만)
+    try {
+      const snap = await fac.collection('reports_trade').get();
+      snap.docs.forEach(d => {
+        const r = d.data();
+        if (!inWeek(r) || r.status !== 'approved') return;
+        const m2 = touch(r.authorId, r.authorName);
+        m2.tradeCount++; m2.tradeAmount += (r.amount || 0);
+        t.tradeCount++; t.tradeAmount += (r.amount || 0);
+      });
+    } catch (e) {}
 
-    fineSnap.docs.forEach(d => {
-      const f = d.data();
-      if (f.archived === true) return;                       // 이미 마감된 건 제외
-      const t = f.createdAt?.toDate?.();
-      if (!t || t < weekStart || t >= weekEnd) return;        // 해당 주가 아니면 제외
+    // 내부경고
+    try {
+      const snap = await fac.collection('warnings').get();
+      snap.docs.forEach(d => {
+        const r = d.data();
+        if (!inWeek(r)) return;
+        const m2 = touch(r.targetId, r.targetName);
+        m2.warnCount++; t.warnCount++;
+      });
+    } catch (e) {}
 
-      const key = f.issuerId || 'unknown';
-      if (!byIssuer[key]) byIssuer[key] = { name: f.issuerName || '-', count: 0, fine: 0, jail: 0 };
-      byIssuer[key].count++;
-      byIssuer[key].fine += f.totalFine || 0;
-      byIssuer[key].jail += f.totalJail || 0;
-      fTotal += f.totalFine || 0;
-      jTotal += f.totalJail || 0;
-      cTotal++;
-    });
+    // 출근부 (date 문자열 기준)
+    try {
+      const startStr = ymdKST(weekStart), endStr = ymdKST(new Date(weekEnd.getTime() - 1));
+      const snap = await fac.collection('attendance').get();
+      snap.docs.forEach(d => {
+        const a = d.data();
+        if (a.archived === true) return;
+        if (!a.date || a.date < startStr || a.date > endStr) return;
+        const m2 = touch(a.userId, a.username);
+        m2.attDays++; t.attCount++;
+      });
+    } catch (e) {}
 
-    if (cTotal === 0) continue;
+    // 벌금 (공무)
+    try {
+      const snap = await fac.collection('fines').get();
+      snap.docs.forEach(d => {
+        const f = d.data();
+        if (!inWeek(f)) return;
+        const m2 = touch(f.issuerId, f.issuerName);
+        m2.fine += (f.totalFine || 0); m2.jail += (f.totalJail || 0); m2.fineCount++;
+        t.fine += (f.totalFine || 0); t.jail += (f.totalJail || 0); t.fineCount++;
+      });
+    } catch (e) {}
+
+    const members = Object.values(byMember);
+    const hasData = t.rpCount || t.tradeCount || t.warnCount || t.attCount || t.fineCount;
+    if (!hasData) continue;
+
     factions.push({
       factionId: facDoc.id,
       factionName: facDoc.data().factionName || '-',
-      totalFine: fTotal, totalJail: jTotal, count: cTotal,
-      members: Object.entries(byIssuer)
-        .map(([id, v]) => ({ issuerId: id, ...v }))
-        .sort((a, b) => b.fine - a.fine),
+      factionType: facDoc.data().factionType || '',
+      ...t,
+      members: members.sort((a, b) => (b.rpScore + b.tradeCount + b.fine) - (a.rpScore + a.tradeCount + a.fine)),
     });
-    grandFine += fTotal; grandJail += jTotal; grandCount += cTotal;
+    Object.keys(grand).forEach(k => { grand[k] += t[k] || 0; });
   }
 
-  factions.sort((a, b) => b.totalFine - a.totalFine);
-  return { factions, grandFine, grandJail, grandCount };
+  factions.sort((a, b) => (b.rpScore + b.tradeCount) - (a.rpScore + a.tradeCount));
+  return { factions, ...grand };
+}
+
+// KST 기준 YYYY-MM-DD
+function ymdKST(date) {
+  const k = new Date(date.getTime() + KST_OFFSET);
+  const p = n => String(n).padStart(2, '0');
+  return `${k.getUTCFullYear()}-${p(k.getUTCMonth() + 1)}-${p(k.getUTCDate())}`;
 }
 
 // GET /api/admin/weekly-stats - 이번 주 전체 팩션 실적 (미리보기)
@@ -636,8 +696,10 @@ app.post('/api/admin/weekly-archive', adminMiddleware, async (req, res) => {
     const weekKey = kstWeekKey(now);
     const result = await aggregateWeek(weekStart, weekEnd);
 
-    if (result.grandCount === 0) {
-      return res.json({ ok: false, reason: '이번 주 부과 내역이 없습니다.' });
+    const totalRecords = (result.rpCount || 0) + (result.tradeCount || 0) + (result.warnCount || 0)
+                       + (result.attCount || 0) + (result.fineCount || 0);
+    if (totalRecords === 0) {
+      return res.json({ ok: false, reason: '이번 주 실적이 없습니다.' });
     }
 
     // 1. 스냅샷 저장
@@ -646,34 +708,47 @@ app.post('/api/admin/weekly-archive', adminMiddleware, async (req, res) => {
       weekStart: weekStart.toISOString(),
       weekEnd: weekEnd.toISOString(),
       factions: result.factions,
-      grandFine: result.grandFine,
-      grandJail: result.grandJail,
-      grandCount: result.grandCount,
+      rpScore: result.rpScore || 0, rpCount: result.rpCount || 0,
+      tradeCount: result.tradeCount || 0, tradeAmount: result.tradeAmount || 0,
+      warnCount: result.warnCount || 0, attCount: result.attCount || 0,
+      fine: result.fine || 0, jail: result.jail || 0, fineCount: result.fineCount || 0,
+      totalRecords,
       archivedAt: admin.firestore.FieldValue.serverTimestamp(),
       reset: doReset,
     });
 
-    // 2. 초기화 - 해당 주 벌금 문서에 archived 표시
+    // 2. 초기화 - 해당 주 문서에 archived 표시 (데이터는 보존)
     let resetCount = 0;
     if (doReset) {
+      const startStr = ymdKST(weekStart), endStr = ymdKST(new Date(weekEnd.getTime() - 1));
       for (const fac of result.factions) {
-        const fineSnap = await db.collection('factions').doc(fac.factionId).collection('fines').get();
-        let batch = db.batch();
-        let n = 0;
-        for (const d of fineSnap.docs) {
-          const f = d.data();
-          if (f.archived === true) continue;
-          const t = f.createdAt?.toDate?.();
-          if (!t || t < weekStart || t >= weekEnd) continue;
-          batch.update(d.ref, { archived: true, archivedWeek: weekKey });
-          n++; resetCount++;
-          if (n % 400 === 0) { await batch.commit(); batch = db.batch(); }
+        const facRef = db.collection('factions').doc(fac.factionId);
+        for (const col of ['reports_rp', 'reports_trade', 'warnings', 'fines', 'attendance']) {
+          let snap;
+          try { snap = await facRef.collection(col).get(); } catch (e) { continue; }
+          let batch = db.batch();
+          let n = 0;
+          for (const d of snap.docs) {
+            const data = d.data();
+            if (data.archived === true) continue;
+            let hit = false;
+            if (col === 'attendance') {
+              hit = !!data.date && data.date >= startStr && data.date <= endStr;
+            } else {
+              const t = data.createdAt?.toDate?.();
+              hit = !!t && t >= weekStart && t < weekEnd;
+            }
+            if (!hit) continue;
+            batch.update(d.ref, { archived: true, archivedWeek: weekKey });
+            n++; resetCount++;
+            if (n % 400 === 0) { await batch.commit(); batch = db.batch(); }
+          }
+          if (n % 400 !== 0) await batch.commit();
         }
-        if (n % 400 !== 0) await batch.commit();
       }
     }
 
-    res.json({ ok: true, weekKey, archived: result.grandCount, reset: doReset, resetCount });
+    res.json({ ok: true, weekKey, archived: totalRecords, reset: doReset, resetCount });
   } catch (err) {
     console.error('[weekly-archive]', err.message);
     res.status(500).json({ ok: false, reason: err.message });
