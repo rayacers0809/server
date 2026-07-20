@@ -538,6 +538,185 @@ app.put('/api/admin/faction/:factionId/status', adminMiddleware, async (req, res
   res.json({ ok: true });
 });
 
+
+// ════════════════════════════════════════════════════════
+// 주간 벌금 실적 - 저장(아카이브) / 초기화 (관리자)
+// 서버는 UTC로 돌 수 있으므로 한국시간(KST) 기준으로 주를 계산
+// ════════════════════════════════════════════════════════
+const KST_OFFSET = 9 * 60 * 60 * 1000;
+
+// 주어진 시각이 속한 주의 시작(한국 일요일 00:00)을 UTC Date로 반환
+function kstWeekStart(date) {
+  const kst = new Date(date.getTime() + KST_OFFSET);       // KST 벽시계
+  const day = kst.getUTCDay();                              // 0=일요일
+  kst.setUTCDate(kst.getUTCDate() - day);
+  kst.setUTCHours(0, 0, 0, 0);
+  return new Date(kst.getTime() - KST_OFFSET);              // 다시 UTC 시각으로
+}
+function kstWeekKey(date) {
+  const start = new Date(kstWeekStart(date).getTime() + KST_OFFSET);
+  const p = n => String(n).padStart(2, '0');
+  return `${start.getUTCFullYear()}-${p(start.getUTCMonth() + 1)}-${p(start.getUTCDate())}`;
+}
+
+// 특정 주의 벌금 집계 (전 팩션)
+async function aggregateWeek(weekStart, weekEnd) {
+  const facSnap = await db.collection('factions').get();
+  const factions = [];
+  let grandFine = 0, grandJail = 0, grandCount = 0;
+
+  for (const facDoc of facSnap.docs) {
+    let fineSnap;
+    try {
+      fineSnap = await facDoc.ref.collection('fines').get();
+    } catch (e) { continue; }
+    if (fineSnap.empty) continue;
+
+    const byIssuer = {};
+    let fTotal = 0, jTotal = 0, cTotal = 0;
+
+    fineSnap.docs.forEach(d => {
+      const f = d.data();
+      if (f.archived === true) return;                       // 이미 마감된 건 제외
+      const t = f.createdAt?.toDate?.();
+      if (!t || t < weekStart || t >= weekEnd) return;        // 해당 주가 아니면 제외
+
+      const key = f.issuerId || 'unknown';
+      if (!byIssuer[key]) byIssuer[key] = { name: f.issuerName || '-', count: 0, fine: 0, jail: 0 };
+      byIssuer[key].count++;
+      byIssuer[key].fine += f.totalFine || 0;
+      byIssuer[key].jail += f.totalJail || 0;
+      fTotal += f.totalFine || 0;
+      jTotal += f.totalJail || 0;
+      cTotal++;
+    });
+
+    if (cTotal === 0) continue;
+    factions.push({
+      factionId: facDoc.id,
+      factionName: facDoc.data().factionName || '-',
+      totalFine: fTotal, totalJail: jTotal, count: cTotal,
+      members: Object.entries(byIssuer)
+        .map(([id, v]) => ({ issuerId: id, ...v }))
+        .sort((a, b) => b.fine - a.fine),
+    });
+    grandFine += fTotal; grandJail += jTotal; grandCount += cTotal;
+  }
+
+  factions.sort((a, b) => b.totalFine - a.totalFine);
+  return { factions, grandFine, grandJail, grandCount };
+}
+
+// GET /api/admin/weekly-stats - 이번 주 전체 팩션 실적 (미리보기)
+app.get('/api/admin/weekly-stats', adminMiddleware, async (req, res) => {
+  try {
+    const now = new Date();
+    const weekStart = kstWeekStart(now);
+    const weekEnd = new Date(weekStart.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const result = await aggregateWeek(weekStart, weekEnd);
+    res.json({
+      ok: true, weekKey: kstWeekKey(now),
+      weekStart: weekStart.toISOString(), weekEnd: weekEnd.toISOString(),
+      ...result,
+    });
+  } catch (err) {
+    console.error('[weekly-stats]', err.message);
+    res.status(500).json({ ok: false, reason: err.message });
+  }
+});
+
+// POST /api/admin/weekly-archive - 이번 주 실적 저장 + 초기화
+// body: { reset: true|false }  reset=true면 집계 대상 벌금을 archived 처리
+app.post('/api/admin/weekly-archive', adminMiddleware, async (req, res) => {
+  const doReset = req.body?.reset === true;
+  try {
+    const now = new Date();
+    const weekStart = kstWeekStart(now);
+    const weekEnd = new Date(weekStart.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const weekKey = kstWeekKey(now);
+    const result = await aggregateWeek(weekStart, weekEnd);
+
+    if (result.grandCount === 0) {
+      return res.json({ ok: false, reason: '이번 주 부과 내역이 없습니다.' });
+    }
+
+    // 1. 스냅샷 저장
+    await db.collection('weekly_archives').doc(weekKey).set({
+      weekKey,
+      weekStart: weekStart.toISOString(),
+      weekEnd: weekEnd.toISOString(),
+      factions: result.factions,
+      grandFine: result.grandFine,
+      grandJail: result.grandJail,
+      grandCount: result.grandCount,
+      archivedAt: admin.firestore.FieldValue.serverTimestamp(),
+      reset: doReset,
+    });
+
+    // 2. 초기화 - 해당 주 벌금 문서에 archived 표시
+    let resetCount = 0;
+    if (doReset) {
+      for (const fac of result.factions) {
+        const fineSnap = await db.collection('factions').doc(fac.factionId).collection('fines').get();
+        let batch = db.batch();
+        let n = 0;
+        for (const d of fineSnap.docs) {
+          const f = d.data();
+          if (f.archived === true) continue;
+          const t = f.createdAt?.toDate?.();
+          if (!t || t < weekStart || t >= weekEnd) continue;
+          batch.update(d.ref, { archived: true, archivedWeek: weekKey });
+          n++; resetCount++;
+          if (n % 400 === 0) { await batch.commit(); batch = db.batch(); }
+        }
+        if (n % 400 !== 0) await batch.commit();
+      }
+    }
+
+    res.json({ ok: true, weekKey, archived: result.grandCount, reset: doReset, resetCount });
+  } catch (err) {
+    console.error('[weekly-archive]', err.message);
+    res.status(500).json({ ok: false, reason: err.message });
+  }
+});
+
+// GET /api/admin/weekly-archives - 저장된 주간 기록 목록
+app.get('/api/admin/weekly-archives', adminMiddleware, async (req, res) => {
+  try {
+    const snap = await db.collection('weekly_archives').orderBy('weekKey', 'desc').limit(20).get();
+    res.json({ ok: true, archives: snap.docs.map(d => d.data()) });
+  } catch (err) {
+    res.json({ ok: true, archives: [] });
+  }
+});
+
+// POST /api/admin/fix-fine-weekkeys - 예전 벌금 문서의 weekKey를 createdAt 기준으로 재계산
+app.post('/api/admin/fix-fine-weekkeys', adminMiddleware, async (req, res) => {
+  try {
+    const facSnap = await db.collection('factions').get();
+    let fixed = 0;
+    for (const facDoc of facSnap.docs) {
+      const fineSnap = await facDoc.ref.collection('fines').get();
+      let batch = db.batch();
+      let n = 0;
+      for (const d of fineSnap.docs) {
+        const f = d.data();
+        const t = f.createdAt?.toDate?.();
+        if (!t) continue;
+        const correct = kstWeekKey(t);
+        if (f.weekKey === correct) continue;
+        batch.update(d.ref, { weekKey: correct });
+        n++; fixed++;
+        if (n % 400 === 0) { await batch.commit(); batch = db.batch(); }
+      }
+      if (n % 400 !== 0) await batch.commit();
+    }
+    res.json({ ok: true, fixed });
+  } catch (err) {
+    res.status(500).json({ ok: false, reason: err.message });
+  }
+});
+
 // GET /api/admin/maintenance - 점검모드 상태 조회 (공개, 인트라넷이 체크)
 app.get('/api/admin/maintenance', async (req, res) => {
   try {
@@ -809,6 +988,30 @@ function buildEmbed(type, d, factionName) {
 // ════════════════════════════════════════════════════════
 // 벌금 부과 (인트라넷 → 게임)
 // ════════════════════════════════════════════════════════
+
+// POST /api/intranet/webhook-test - 웹훅 URL 테스트 전송 (브라우저 CORS 우회)
+app.post('/api/intranet/webhook-test', authMiddleware, async (req, res) => {
+  const { url, type } = req.body;
+  if (!url || !url.includes('discord.com/api/webhooks/')) {
+    return res.status(400).json({ ok: false, reason: '올바른 Discord 웹훅 URL이 아닙니다.' });
+  }
+  const typeNames = { rp:'RP 보고서', trade:'거래 보고서', warn:'내부경고', notice:'공지사항', member:'팩션원', fine:'벌금 부과' };
+  try {
+    await axios.post(url, {
+      username: 'Turn City 인트라넷',
+      embeds: [{
+        title: '✅ 웹훅 테스트',
+        description: `${typeNames[type] || '알림'} 웹훅이 정상적으로 연결되었습니다.`,
+        color: 0x4F8EF7,
+        footer: { text: 'Turn City 인트라넷' },
+        timestamp: new Date().toISOString(),
+      }],
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, reason: '전송 실패: ' + err.message });
+  }
+});
 
 // POST /api/intranet/fine - 인트라넷에서 벌금 부과 → 게임으로 전달
 app.post('/api/intranet/fine', authMiddleware, async (req, res) => {
